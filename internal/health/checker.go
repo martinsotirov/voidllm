@@ -4,8 +4,8 @@
 package health
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/config"
-	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
@@ -55,6 +54,23 @@ type probeTarget struct {
 	gcpLocation string
 }
 
+// asProbeTarget converts t to the exported ProbeTarget shape that
+// BuildProbeRequest accepts. key and modelType are Checker-internal
+// dispatch/labelling fields with no bearing on request construction and are
+// intentionally not carried over.
+func (t probeTarget) asProbeTarget() ProbeTarget {
+	return ProbeTarget{
+		ModelName:       t.modelName,
+		Provider:        t.provider,
+		BaseURL:         t.baseURL,
+		APIKey:          t.apiKey,
+		AzureDeployment: t.azureDeployment,
+		AzureAPIVersion: t.azureAPIVersion,
+		GCPProject:      t.gcpProject,
+		GCPLocation:     t.gcpLocation,
+	}
+}
+
 // ModelHealth holds the most recent health state for a single upstream model.
 type ModelHealth struct {
 	// ModelName is the canonical registry name of the model.
@@ -64,8 +80,12 @@ type ModelHealth struct {
 	Status string `json:"status"`
 	// LastCheck is the UTC timestamp of the most recent probe cycle.
 	LastCheck time.Time `json:"last_check"`
-	// LastError holds the error message from the most recently failed probe,
-	// or is empty when all probes passed.
+	// LastError is derived from HealthError, ModelsError, and FunctionalError
+	// using the same health > models > functional priority as Status, for
+	// consumers that display a single error value. It is empty when every
+	// enabled and applicable probe is currently passing. Prefer HealthError,
+	// ModelsError, and FunctionalError when it matters which probe produced
+	// the message.
 	LastError string `json:"last_error,omitempty"`
 	// LatencyMs is the round-trip time of the most recent successful probe
 	// in milliseconds. Zero when no probe has succeeded yet.
@@ -80,17 +100,46 @@ type ModelHealth struct {
 	// reflects whether the last POST /chat/completions probe returned a 2xx
 	// response.
 	FunctionalOK *bool `json:"functional_ok"`
+	// HealthError holds the sanitized error from the most recent health
+	// probe. It is empty when the probe is disabled, has not yet run, or
+	// last succeeded.
+	HealthError string `json:"health_error,omitempty"`
+	// ModelsError holds the sanitized error from the most recent models
+	// probe. It is empty when the probe is disabled, not applicable to the
+	// target's provider, has not yet run, or last succeeded.
+	ModelsError string `json:"models_error,omitempty"`
+	// FunctionalError holds the sanitized error from the most recent
+	// functional probe. It is empty when the probe is disabled, not
+	// applicable to the target's model type, has not yet run, or last
+	// succeeded.
+	FunctionalError string `json:"functional_error,omitempty"`
 }
 
 // Checker periodically probes all models registered in the proxy.Registry at
 // up to three configurable levels and stores the results in memory. All methods
 // are safe for concurrent use.
+//
+// results is a sync.Map so that GetHealth and GetAllHealth stay lock-free on
+// the request hot path. mu protects only the load-copy-mutate-store sequence
+// in runOne: up to three probe levels (health, models, functional) run on
+// independent tickers and can race to update the same key, and without
+// serialization one level's Store can silently overwrite a concurrent
+// update from another level (a lost update, not a data race — copying the
+// struct before mutating already prevents the latter). Readers never take
+// mu: runOne stores a value only once it is fully populated, so whether a
+// reader loads before or after a concurrent write it always observes a
+// complete, internally consistent *ModelHealth.
 type Checker struct {
 	registry *proxy.Registry
 	results  sync.Map // map[string]*ModelHealth — keyed by probeTarget.key, replaced atomically
-	cfg      config.HealthCheckConfig
-	client   *http.Client
-	log      *slog.Logger
+	// mu serializes the read-modify-write sequence in runOne across
+	// concurrently running probe levels. It is never held during network
+	// I/O (execProbe) and is never taken by readers (GetHealth,
+	// GetAllHealth) — see the Checker doc comment.
+	mu     sync.Mutex
+	cfg    config.HealthCheckConfig
+	client *http.Client
+	log    *slog.Logger
 }
 
 // NewChecker constructs a Checker that will probe the models in registry
@@ -118,7 +167,9 @@ func NewChecker(registry *proxy.Registry, cfg config.HealthCheckConfig, log *slo
 // within a multi-deployment model key is "modelName/deploymentName". It
 // returns nil and false when the target has not yet been probed.
 // The returned pointer is safe to read without further synchronization —
-// stored values are never mutated after being placed in the map.
+// stored values are never mutated after being placed in the map. This holds
+// even though writers serialize on Checker.mu: GetHealth intentionally does
+// not acquire it, since the map only ever holds fully-formed snapshots.
 func (c *Checker) GetHealth(key string) (*ModelHealth, bool) {
 	v, ok := c.results.Load(key)
 	if !ok {
@@ -230,48 +281,92 @@ func (c *Checker) runAll(level probeLevel) {
 }
 
 // runOne executes a single probe for the given target at the given level and
-// atomically replaces the stored ModelHealth using copy-on-write to avoid data
-// races.
+// atomically replaces the stored ModelHealth using copy-on-write.
 func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
 	latencyMs, err := execProbe(ctx, c.client, t, level)
 
+	// From here on we only touch in-memory state — no network I/O — so hold
+	// mu for the remainder of the function. Health, models, and functional
+	// probes run on independent tickers and can reach this point for the
+	// same key concurrently; without the lock, two levels could both load
+	// the same old snapshot and the second Store would silently discard the
+	// first level's update (a lost update). Copy-on-write alone prevents a
+	// data race on the struct fields, but not this lost-update race between
+	// levels — mu is what serializes the load-copy-mutate-store sequence.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Load existing or create a zero value to copy from.
 	existing, _ := c.results.LoadOrStore(t.key, &ModelHealth{ModelName: t.key, Status: "unknown"})
 	old := existing.(*ModelHealth)
 
-	// Copy-on-write: mutate the copy, then store atomically. This eliminates
-	// the data race that would occur if multiple probe-level goroutines
-	// mutated the same *ModelHealth in place.
+	// Copy-on-write: mutate the copy, then store atomically, so a concurrent
+	// reader that already holds the old pointer (see GetHealth) never
+	// observes a partially-updated struct.
 	updated := *old
 	updated.LastCheck = time.Now().UTC()
 
+	if errors.Is(err, ErrProbeNotApplicable) {
+		// This probe has no meaningful equivalent for the target's provider
+		// or model type (e.g. a models-list probe against Gemini, or a
+		// functional probe against an image model). Leave the level's field
+		// nil — deriveStatus already treats nil as "not checked" — rather
+		// than recording a success that never actually ran, or a failure
+		// that would wrongly drag the status to degraded/unhealthy. Also
+		// clear the level's own error field: a probe that just became
+		// not-applicable (e.g. after a model type edit) must not keep
+		// displaying a stale failure from when it was still applicable.
+		//
+		// levelHealth never appears here: probeHealth pings the bare server
+		// root directly and never routes through BuildProbeRequest, so it
+		// can never return ErrProbeNotApplicable.
+		switch level {
+		case levelModels:
+			updated.ModelsOK = nil
+			updated.ModelsError = ""
+		case levelFunctional:
+			updated.FunctionalOK = nil
+			updated.FunctionalError = ""
+		}
+		updated.LastError = deriveLastError(&updated)
+		updated.Status = deriveStatus(&updated)
+		c.results.Store(t.key, &updated)
+		updateMetrics(t.key, &updated)
+		return
+	}
+
 	ok := err == nil
+	var sanitized string
 	if ok {
 		updated.LatencyMs = latencyMs
-		updated.LastError = ""
 	} else {
-		updated.LastError = sanitizeError(err)
+		sanitized = sanitizeError(err)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "health probe failed",
 			slog.String("key", t.key),
-			slog.String("error", updated.LastError),
+			slog.String("error", sanitized),
 		)
 	}
 
+	// Each level owns its own error field. Assigning sanitized (empty on
+	// success) here, rather than sharing one field across levels, ensures a
+	// successful run of one probe never wipes a genuine failure recorded by
+	// another.
 	switch level {
 	case levelHealth:
 		updated.HealthOK = &ok
-		if ok {
-			updated.LatencyMs = latencyMs
-		}
+		updated.HealthError = sanitized
 	case levelModels:
 		updated.ModelsOK = &ok
+		updated.ModelsError = sanitized
 	case levelFunctional:
 		updated.FunctionalOK = &ok
+		updated.FunctionalError = sanitized
 	}
 
+	updated.LastError = deriveLastError(&updated)
 	updated.Status = deriveStatus(&updated)
 	c.results.Store(t.key, &updated)
 
@@ -357,115 +452,50 @@ func probeHealth(ctx context.Context, client *http.Client, t probeTarget) (int64
 	return latencyMs, nil
 }
 
-// probeModels performs a GET to <base_url>/models and returns success on any
-// 2xx HTTP response.
+// probeModels performs a GET to the provider's model-listing endpoint (built
+// by BuildProbeRequest, provider-aware) and returns success on any 2xx HTTP
+// response. It returns ErrProbeNotApplicable for providers whose adapter has
+// no meaningful model-listing endpoint (azure, vertex, gemini) — see
+// BuildProbeRequest's doc for the full rationale.
 func probeModels(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/models"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("build request: %w", err)
-	}
-
-	setAuthHeaders(req, t)
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	latencyMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return latencyMs, nil
+	return probeWithIntent(ctx, client, IntentModelsList, t)
 }
 
 // probeFunctional dispatches to the appropriate functional probe based on the
 // target's model type. Image, audio_transcription, and tts models are skipped
-// because they are too expensive or require special binary input to probe
-// meaningfully.
+// (ErrProbeNotApplicable) because they are too expensive or require special
+// binary input to probe meaningfully.
 func probeFunctional(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
 	switch t.modelType {
 	case "embedding":
-		return probeEmbedding(ctx, client, t)
+		return probeWithIntent(ctx, client, IntentEmbeddings, t)
 	case "reranking", "image", "audio_transcription", "tts":
 		// Skip — incompatible endpoint or too expensive to probe.
-		return 0, nil
+		return 0, ErrProbeNotApplicable
 	default: // "chat", "completion", ""
-		return probeFunctionalChat(ctx, client, t)
+		return probeWithIntent(ctx, client, IntentChat, t)
 	}
 }
 
-// probeFunctionalChat performs a minimal POST /chat/completions request with a
-// single-token max to verify end-to-end functionality of the upstream model.
-// For Azure targets the deployment name is used as the model identifier.
-func probeFunctionalChat(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/chat/completions"
-
-	upstreamModel := t.modelName
-	if t.provider == "azure" && t.azureDeployment != "" {
-		upstreamModel = t.azureDeployment
-	}
-
-	payload := map[string]any{
-		"model":      upstreamModel,
-		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens": 1,
-	}
-	body, err := jsonx.Marshal(payload)
+// probeWithIntent builds a provider-aware probe request for intent via
+// BuildProbeRequest and executes it, returning ErrProbeNotApplicable
+// unchanged so callers (probeFunctional, runOne) can distinguish "skipped"
+// from "failed".
+func probeWithIntent(ctx context.Context, client *http.Client, intent ProbeIntent, t probeTarget) (int64, error) {
+	req, err := BuildProbeRequest(ctx, intent, t.asProbeTarget())
 	if err != nil {
-		return 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
-	if err != nil {
+		if errors.Is(err, ErrProbeNotApplicable) {
+			return 0, err
+		}
 		return 0, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	setAuthHeaders(req, t)
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	latencyMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return latencyMs, nil
+	return doProbeRequest(client, req)
 }
 
-// probeEmbedding performs a minimal POST /embeddings request with a single
-// short input string to verify end-to-end functionality of an embedding model.
-func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/embeddings"
-
-	payload := map[string]any{
-		"model": t.modelName,
-		"input": "test",
-	}
-	body, err := jsonx.Marshal(payload)
-	if err != nil {
-		return 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	setAuthHeaders(req, t)
-
+// doProbeRequest executes req and returns success on any 2xx HTTP response.
+// It is shared by every probe that treats "2xx" as the pass/fail boundary
+// (models-list, functional chat, functional embeddings).
+func doProbeRequest(client *http.Client, req *http.Request) (int64, error) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	latencyMs := time.Since(start).Milliseconds()
@@ -482,8 +512,14 @@ func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (in
 }
 
 // setAuthHeaders adds the appropriate authentication headers to req based on
-// the target's provider. Anthropic uses the x-api-key header scheme; all other
-// providers use Bearer token authorization.
+// the target's provider. It is used only by probeHealth: probeModels and
+// probeFunctional build their requests via BuildProbeRequest, which sets
+// provider-correct headers through the same proxy.Adapter.SetHeaders logic
+// the real proxy hot path uses. probeHealth intentionally stays independent
+// of BuildProbeRequest because it hits the bare server root, not a
+// provider-shaped endpoint, and treats any HTTP response as success — the
+// exact header scheme used barely matters for that check, but Anthropic's
+// x-api-key scheme is still applied for parity with a normal request.
 func setAuthHeaders(req *http.Request, t probeTarget) {
 	if t.apiKey == "" {
 		return
@@ -494,6 +530,22 @@ func setAuthHeaders(req *http.Request, t probeTarget) {
 	} else {
 		req.Header.Set("Authorization", "Bearer "+t.apiKey)
 	}
+}
+
+// deriveLastError picks the single error message to expose as LastError for
+// consumers that show one value. It follows the same precedence as
+// deriveStatus: a failed reachability probe outranks a failed models probe,
+// which outranks a failed functional probe, so the reported message always
+// describes the most severe current failure. It returns an empty string when
+// every enabled and applicable probe is passing.
+func deriveLastError(h *ModelHealth) string {
+	if h.HealthError != "" {
+		return h.HealthError
+	}
+	if h.ModelsError != "" {
+		return h.ModelsError
+	}
+	return h.FunctionalError
 }
 
 // deriveStatus computes the overall status from the individual probe results.

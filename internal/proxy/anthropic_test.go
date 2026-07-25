@@ -2873,6 +2873,18 @@ func TestAnthropicTransformURL(t *testing.T) {
 			upstreamPath: "embeddings",
 			wantURL:      "https://api.anthropic.com/embeddings",
 		},
+		{
+			name:         "models maps to /v1/models",
+			baseURL:      "https://api.anthropic.com",
+			upstreamPath: "models",
+			wantURL:      "https://api.anthropic.com/v1/models",
+		},
+		{
+			name:         "trailing slash on base with models path does not produce double slash",
+			baseURL:      "https://api.anthropic.com/",
+			upstreamPath: "models",
+			wantURL:      "https://api.anthropic.com/v1/models",
+		},
 	}
 
 	for _, tc := range tests {
@@ -2887,7 +2899,7 @@ func TestAnthropicTransformURL(t *testing.T) {
 			}
 
 			// Guard against double slashes in the result (common trailing-slash bug).
-			if strings.Contains(got, "//") && !strings.HasPrefix(got, "https://") {
+			if strings.Contains(got, "//") {
 				// Allow the protocol scheme's "//"; check after stripping it.
 				noScheme := strings.SplitN(got, "://", 2)
 				if len(noScheme) == 2 && strings.Contains(noScheme[1], "//") {
