@@ -231,10 +231,58 @@ describe('Select', () => {
       expect(screen.getAllByRole('option')).toHaveLength(options.length)
       expect(screen.getByPlaceholderText('Search...')).toHaveValue('')
     })
+
+    it('ArrowDown and Enter still work while focus is in the search input', async () => {
+      // The searchable path was always reachable — focus genuinely sits in
+      // the search input (auto-focused on open), and these keydowns bubble
+      // from the input up to the listbox's own onKeyDown. This is the one
+      // path the trigger-keyboard fix did not need to touch; kept covered
+      // here to prove it wasn't disturbed.
+      const onChange = vi.fn()
+      renderSelect({ searchable: true, onChange })
+      await userEvent.click(screen.getByRole('combobox'))
+      const searchInput = screen.getByPlaceholderText('Search...')
+
+      fireEvent.keyDown(searchInput, { key: 'ArrowDown' })
+      const opts = screen.getAllByRole('option')
+      expect(opts[1].className).toContain('bg-bg-tertiary')
+
+      fireEvent.keyDown(searchInput, { key: 'Enter' })
+      expect(onChange).toHaveBeenCalledWith('banana')
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    })
+
+    it('Space in the search input types a space instead of selecting the highlighted option', async () => {
+      // This is the reason Space is handled on the trigger only
+      // (handleTriggerKeyDown) and deliberately left out of the shared
+      // handleNavigationKeyDown that the search input's keydowns bubble
+      // into — here Space must stay ordinary text entry.
+      const onChange = vi.fn()
+      renderSelect({ searchable: true, onChange })
+      await userEvent.click(screen.getByRole('combobox'))
+      const searchInput = screen.getByPlaceholderText('Search...')
+
+      await userEvent.type(searchInput, 'a a')
+
+      expect(searchInput).toHaveValue('a a')
+      expect(onChange).not.toHaveBeenCalled()
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+    })
   })
 
   // ---------------------------------------------------------------------------
   // Keyboard Navigation
+  //
+  // Every keydown below is dispatched to the trigger (getByRole('combobox')),
+  // never to the listbox. When `searchable` is false the menu is a portalled
+  // sibling of the trigger, not a descendant — a real user has no way to
+  // move focus onto it, so a test that fires keys at getByRole('listbox')
+  // would pass whether or not the trigger actually forwards those keys to
+  // navigation. Open/close and highlight movement while the menu is open
+  // live on handleTriggerKeyDown, which delegates to the shared
+  // handleNavigationKeyDown; the listbox's own onKeyDown only matters for
+  // the searchable path, where focus genuinely sits in the search input
+  // inside the menu — that path is covered separately in Searchable below.
   // ---------------------------------------------------------------------------
 
   describe('Keyboard Navigation', () => {
@@ -256,85 +304,180 @@ describe('Select', () => {
       expect(screen.getByRole('listbox')).toBeInTheDocument()
     })
 
-    it('ArrowDown moves highlight to next option', async () => {
+    it('ArrowDown on the trigger moves highlight to next option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
       // Initially highlight index is 0 (Apple). Move down to Banana (index 1).
-      fireEvent.keyDown(listbox, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
       const opts = screen.getAllByRole('option')
       // Index 1 (Banana) should now have the highlighted background class
       expect(opts[1].className).toContain('bg-bg-tertiary')
     })
 
-    it('ArrowUp moves highlight to previous option', async () => {
+    it('ArrowUp on the trigger moves highlight to previous option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
       // Move down twice then back up once
-      fireEvent.keyDown(listbox, { key: 'ArrowDown' })
-      fireEvent.keyDown(listbox, { key: 'ArrowDown' })
-      fireEvent.keyDown(listbox, { key: 'ArrowUp' })
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: 'ArrowUp' })
       const opts = screen.getAllByRole('option')
       expect(opts[1].className).toContain('bg-bg-tertiary')
     })
 
-    it('Enter selects highlighted option and closes dropdown', async () => {
+    it('Enter on the trigger selects highlighted option and closes dropdown', async () => {
       const onChange = vi.fn()
       renderSelect({ onChange })
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
       // Highlight index starts at 0 (Apple)
-      fireEvent.keyDown(listbox, { key: 'Enter' })
+      fireEvent.keyDown(trigger, { key: 'Enter' })
       expect(onChange).toHaveBeenCalledWith('apple')
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     })
 
-    it('Home highlights first option', async () => {
+    it('Space on the trigger selects the highlighted option when the menu is open', async () => {
+      // Space stays trigger-only (handleTriggerKeyDown), distinct from
+      // handleNavigationKeyDown which every other case here goes through —
+      // see the Searchable describe for the contrasting case where Space
+      // must NOT select because it is ordinary typing in the search input.
+      const onChange = vi.fn()
+      renderSelect({ onChange })
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: ' ' })
+      expect(onChange).toHaveBeenCalledWith('banana')
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+      expect(document.activeElement).toBe(trigger)
+    })
+
+    it('Home on the trigger highlights first option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
       // Move to last, then Home back to first
-      fireEvent.keyDown(listbox, { key: 'End' })
-      fireEvent.keyDown(listbox, { key: 'Home' })
+      fireEvent.keyDown(trigger, { key: 'End' })
+      fireEvent.keyDown(trigger, { key: 'Home' })
       const opts = screen.getAllByRole('option')
       expect(opts[0].className).toContain('bg-bg-tertiary')
     })
 
-    it('End highlights last option', async () => {
+    it('End on the trigger highlights last option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
-      fireEvent.keyDown(listbox, { key: 'End' })
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      fireEvent.keyDown(trigger, { key: 'End' })
       const opts = screen.getAllByRole('option')
       expect(opts[opts.length - 1].className).toContain('bg-bg-tertiary')
     })
 
-    it('ArrowDown does not move highlight past the last option', async () => {
+    it('ArrowDown on the trigger does not move highlight past the last option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
       // Press ArrowDown many times beyond the list length
       for (let i = 0; i < 10; i++) {
-        fireEvent.keyDown(listbox, { key: 'ArrowDown' })
+        fireEvent.keyDown(trigger, { key: 'ArrowDown' })
       }
       const opts = screen.getAllByRole('option')
       expect(opts[opts.length - 1].className).toContain('bg-bg-tertiary')
     })
 
-    it('ArrowUp does not move highlight before the first option', async () => {
+    it('ArrowUp on the trigger does not move highlight before the first option', async () => {
       renderSelect()
-      await userEvent.click(screen.getByRole('combobox'))
-      const listbox = screen.getByRole('listbox')
-      fireEvent.keyDown(listbox, { key: 'ArrowUp' })
-      fireEvent.keyDown(listbox, { key: 'ArrowUp' })
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      fireEvent.keyDown(trigger, { key: 'ArrowUp' })
+      fireEvent.keyDown(trigger, { key: 'ArrowUp' })
       const opts = screen.getAllByRole('option')
       expect(opts[0].className).toContain('bg-bg-tertiary')
+    })
+
+    it('opens and navigates entirely from the keyboard, without ever clicking the trigger', () => {
+      // ArrowDown on the closed trigger both opens the menu and is the same
+      // key a user keeps pressing to move the highlight afterwards — this
+      // exercises the whole open-then-navigate flow without a single mouse
+      // interaction anywhere in the test.
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      const opts = screen.getAllByRole('option')
+      expect(opts[2].className).toContain('bg-bg-tertiary')
     })
 
     it('disabled trigger ignores keyboard open keys', () => {
       renderSelect({ disabled: true })
       fireEvent.keyDown(screen.getByRole('combobox'), { key: 'ArrowDown' })
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    })
+
+    // Deliberate asymmetry with "Tab in searchable menu" below: the trigger
+    // is already inside an ancestor Dialog's focus trap, so this Tab handler
+    // only has to close the menu, not intercept the key — leaving
+    // preventDefault uncalled lets the browser move focus on as normal
+    // instead of stranding the menu open behind it. Contrast the searchable
+    // path, which does call preventDefault because its search input lives in
+    // the portal, outside the trap's reach.
+    it('Tab on the trigger closes the dropdown without preventing default', async () => {
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      // fireEvent.keyDown returns the result of dispatchEvent: true unless
+      // preventDefault() was called on the (cancelable) event.
+      const notPrevented = fireEvent.keyDown(trigger, { key: 'Tab' })
+      expect(screen.queryByRole('listbox')).toBeNull()
+      expect(notPrevented).toBe(true)
+    })
+
+    it('recovers when options arrive after ArrowDown was pressed against an empty list, keeping the trigger operable', async () => {
+      // Every Select in this app is fed from an in-flight query, so it
+      // routinely opens with an empty `options` array before results land.
+      // ArrowDown against that empty list drives highlightIndex to -1
+      // (Math.min(0 + 1, filteredOptions.length - 1) is Math.min(1, -1) with
+      // zero options) — clampedHighlight's lower bound is what stops that -1
+      // from surviving once options arrive on a rerender. Without it,
+      // aria-activedescendant would reference a nonexistent option id and
+      // Enter would index filteredOptions with -1, selecting nothing.
+      const onChange = vi.fn()
+      const { rerender } = render(
+        <Select options={[]} value="" onChange={onChange} />,
+      )
+      const trigger = screen.getByRole('combobox')
+
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      expect(screen.getByText('No results')).toBeInTheDocument()
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+
+      // Options arrive — the menu stays open, highlightIndex is untouched by
+      // the rerender itself.
+      rerender(<Select options={options} value="" onChange={onChange} />)
+
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(activeId).toBeTruthy()
+      const activeEl = document.getElementById(activeId!)
+      expect(activeEl).not.toBeNull()
+      expect(activeEl).toHaveTextContent('Apple')
+
+      // The step that was missing: a further ArrowDown must actually move
+      // the highlight, not silently no-op because it stepped from the raw
+      // (still -1) state instead of the clamped, on-screen one.
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      const secondActiveId = trigger.getAttribute('aria-activedescendant')
+      expect(secondActiveId).toBeTruthy()
+      const secondActiveEl = document.getElementById(secondActiveId!)
+      expect(secondActiveEl).not.toBeNull()
+      expect(secondActiveEl).toHaveTextContent('Banana')
+
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      expect(onChange).toHaveBeenCalledWith('banana')
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     })
   })
@@ -416,8 +559,10 @@ describe('Select', () => {
       renderSelect()
       const trigger = screen.getByRole('combobox')
       await userEvent.click(trigger)
-      const listbox = screen.getByRole('listbox')
-      fireEvent.keyDown(listbox, { key: 'Enter' })
+      // Enter is dispatched to the trigger — see the Keyboard Navigation
+      // describe above for why the listbox is never a legitimate keydown
+      // target for the non-searchable path.
+      fireEvent.keyDown(trigger, { key: 'Enter' })
       expect(document.activeElement).toBe(trigger)
     })
 
@@ -449,7 +594,7 @@ describe('Select', () => {
   // ---------------------------------------------------------------------------
 
   describe('aria-activedescendant', () => {
-    it('trigger has aria-activedescendant pointing to first option when opened', async () => {
+    it('trigger has aria-activedescendant pointing to first option when opened with no value selected', async () => {
       renderSelect()
       const trigger = screen.getByRole('combobox')
       await userEvent.click(trigger)
@@ -467,16 +612,79 @@ describe('Select', () => {
       )
     })
 
-    it('aria-activedescendant updates when highlight changes via ArrowDown', async () => {
+    it('aria-activedescendant updates when highlight changes via ArrowDown on the trigger', async () => {
       renderSelect()
       const trigger = screen.getByRole('combobox')
       await userEvent.click(trigger)
-      const listbox = screen.getByRole('listbox')
-      fireEvent.keyDown(listbox, { key: 'ArrowDown' })
+      // Dispatched to the trigger, not the listbox — see the Keyboard
+      // Navigation describe above for why.
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
       const activeId = trigger.getAttribute('aria-activedescendant')
       expect(activeId).toBeTruthy()
       const activeEl = document.getElementById(activeId!)
       expect(activeEl).toHaveTextContent('Banana')
+    })
+
+    it('tracks the highlight on the trigger through a fully keyboard-driven open-and-navigate interaction', () => {
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      const activeOption = () =>
+        document.getElementById(trigger.getAttribute('aria-activedescendant')!)
+
+      // Open via ArrowDown on the closed trigger — no mouse involved at any
+      // point in this test. Starts on Apple (index 0).
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      expect(activeOption()).toHaveTextContent('Apple')
+
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      expect(activeOption()).toHaveTextContent('Cherry')
+
+      fireEvent.keyDown(trigger, { key: 'ArrowUp' })
+      expect(activeOption()).toHaveTextContent('Banana')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Initial highlight seeding (getInitialHighlightIndex) — opening the menu
+  // seeds the highlight on the currently selected option instead of always
+  // starting at index 0, on both paths that can open the menu: a mouse click
+  // on the trigger and a keyboard open key (ArrowDown/Enter/Space) on the
+  // closed trigger. Falls back to the first option when `value` is empty or
+  // does not match any option.
+  // ---------------------------------------------------------------------------
+
+  describe('Initial highlight seeding', () => {
+    it('click-opening seeds the highlight on the option matching the current value', async () => {
+      renderSelect({ value: 'banana' })
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(document.getElementById(activeId!)).toHaveTextContent('Banana')
+    })
+
+    it('keyboard-opening (ArrowDown on the closed trigger) seeds the highlight on the option matching the current value', () => {
+      renderSelect({ value: 'cherry' })
+      const trigger = screen.getByRole('combobox')
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(document.getElementById(activeId!)).toHaveTextContent('Cherry')
+    })
+
+    it('falls back to the first option when value does not match any option (click-open)', async () => {
+      renderSelect({ value: 'durian' })
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(document.getElementById(activeId!)).toHaveTextContent('Apple')
+    })
+
+    it('falls back to the first option when value is empty (keyboard-open)', () => {
+      renderSelect({ value: '' })
+      const trigger = screen.getByRole('combobox')
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(document.getElementById(activeId!)).toHaveTextContent('Apple')
     })
   })
 
